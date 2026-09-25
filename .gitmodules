@@ -1,0 +1,3 @@
+[submodule "server/model"]
+	path = server/model
+	url = https://huggingface.co/mah92/sherpa-onnx-nemo-ctc-fa-shenava-koochik-v1.0-streaming-2026-06-26

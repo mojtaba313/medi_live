@@ -1,0 +1,27 @@
+# python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# node
+node_modules/
+client/dist/
+
+# logs
+*.log
+
+# local secrets & dev TLS certs (never commit)
+*.pem
+.env.local
+
+# server runtime state (recreated automatically)
+rooms.json
+server/rooms.json
+server/archive/*
+!server/archive/.gitkeep
+
+# large local audio (demo data + generated cache, not shipped)
+server/class.mp3
+server/class_16k.wav
+*.mp3
