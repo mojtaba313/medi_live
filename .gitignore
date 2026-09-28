@@ -11,6 +11,9 @@ client/dist/
 # logs
 *.log
 
+# archive
+archive/
+
 # local secrets & dev TLS certs (never commit)
 *.pem
 .env.local

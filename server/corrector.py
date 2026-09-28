@@ -31,6 +31,8 @@ import logging
 import os
 import re
 import time
+from difflib import get_close_matches
+from pathlib import Path
 
 log = logging.getLogger("corrector")
 
@@ -89,6 +91,86 @@ _SENT_END = re.compile(r"[.؟?!…]+$|.*[.؟?!…]['\"»)\]]?\s*$")
 
 def looks_sentence_complete(text: str) -> bool:
     return bool(_SENT_END.match(text.strip()))
+
+
+# ------------------------------------------------- medical glossary + ITN
+
+_HERE = Path(__file__).resolve().parent
+_GLOSSARY_PATH = Path(os.getenv("MEDICAL_GLOSSARY", str(_HERE / "medical_glossary.json")))
+
+# Canonical medical/anatomy terms (Persian). Loaded from medical_glossary.json
+# next to this file; missing file -> empty list (normalizer still works).
+GLOSSARY_TERMS: list[str] = []
+try:
+    if _GLOSSARY_PATH.exists():
+        import json as _json
+        _data = _json.loads(_GLOSSARY_PATH.read_text(encoding="utf-8"))
+        GLOSSARY_TERMS = [str(t).strip() for t in _data.get("terms", []) if str(t).strip()]
+except Exception as e:
+    log.warning("medical glossary load failed (%s); continuing without it", e)
+
+# Lowercased lookup for Latin terms: ASR often emits them lowercase
+# ("cornea") while the glossary holds canonical case ("Cornea").
+_GLOSSARY_LOWER = {t.lower(): t for t in GLOSSARY_TERMS if t.isascii()}
+
+# Spoken Persian numbers -> Persian digits (single tokens only; conservative).
+_SPOKEN_DIGITS = {
+    "صفر": "۰", "یک": "۱", "دو": "۲", "سه": "۳", "چهار": "۴",
+    "پنج": "۵", "شش": "۶", "هفت": "۷", "هشت": "۸", "نه": "۹",
+    "ده": "۱۰", "یازده": "۱۱", "دوازده": "۱۲", "سیزده": "۱۳",
+    "چهارده": "۱۴", "پانزده": "۱۵", "شانزده": "۱۶", "هفده": "۱۷",
+    "هجده": "۱۸", "نوزده": "۱۹", "بیست": "۲۰", "سی": "۳۰",
+    "چهل": "۴۰", "پنجاه": "۵۰", "شصت": "۶۰", "هفتاد": "۷۰",
+    "هشتاد": "۸۰", "نود": "۹۰", "صد": "۱۰۰", "دویست": "۲۰۰",
+    "هزار": "۱۰۰۰",
+}
+
+_STRIP_PUNCT = "،؛؟!.:?!,…«»\"'\"()[]{}<>-–—/\\"
+
+
+def apply_medical_glossary(text: str) -> str:
+    """Snap near-miss words to glossary terms (fixes CTC mishearing of
+    anatomical/Latin terms). Conservative: only words >= 6 chars, similarity
+    >= 0.86, never touches words already correct."""
+    if not text or not GLOSSARY_TERMS:
+        return text
+    out = []
+    for w in text.split():
+        core = w
+        # split leading/trailing punctuation properly
+        lead, trail = "", ""
+        while core and core[0] in _STRIP_PUNCT:
+            lead += core[0]
+            core = core[1:]
+        while core and core[-1] in _STRIP_PUNCT:
+            trail = core[-1] + trail
+            core = core[:-1]
+        # Latin-script words can be short ("Lens", "RPE") — script mismatch
+        # with Persian text makes short matches safe; Persian words need >= 6.
+        min_len = 4 if core.isascii() and core.isalpha() else 6
+        if len(core) >= min_len and core not in GLOSSARY_TERMS:
+            # Shorter words need a looser cutoff: one substitution in a
+            # 6-char word scores ~0.83, so 0.86 would never fire there.
+            cutoff = 0.8 if len(core) < 8 else 0.86
+            if core.isascii():
+                m = get_close_matches(core.lower(), list(_GLOSSARY_LOWER),
+                                      n=1, cutoff=cutoff)
+                if m:
+                    core = _GLOSSARY_LOWER[m[0]]
+            else:
+                m = get_close_matches(core, GLOSSARY_TERMS, n=1, cutoff=cutoff)
+                if m:
+                    core = m[0]
+        out.append(lead + core + trail)
+    return " ".join(out)
+
+
+def spoken_to_digits(text: str) -> str:
+    """Map standalone spoken number words to Persian digits (display ITN:
+    the acoustic model emits spoken form, e.g. 'پنج' for ۵)."""
+    if not text:
+        return text
+    return " ".join(_SPOKEN_DIGITS.get(w, w) for w in text.split())
 
 
 # ------------------------------------------------------- LLM backends
@@ -176,6 +258,7 @@ class TextCorrector:
             self.backend = "openai" if self.openai_key else "local"
 
         log.info("corrector backend: requested=%s effective=%s", self.requested, self.backend)
+        log.info("medical glossary: %d terms from %s", len(GLOSSARY_TERMS), _GLOSSARY_PATH.name)
 
     @property
     def enabled(self) -> bool:
@@ -193,7 +276,8 @@ class TextCorrector:
             model = self.ollama_model
         return {"backend": self.backend, "model": model,
                 "min_chars": CORRECT_MIN_CHARS, "max_chars": CORRECT_MAX_CHARS,
-                "timeout_s": CORRECT_TIMEOUT_S}
+                "timeout_s": CORRECT_TIMEOUT_S,
+                "glossary_n": len(GLOSSARY_TERMS)}
 
     async def correct(self, raw: str, context: str = "") -> str | None:
         """Return corrected text, or None if disabled/empty/unusable."""
@@ -201,8 +285,9 @@ class TextCorrector:
         if not raw or not self.enabled:
             return None
         normalized = local_normalize(raw)
+        normalized = spoken_to_digits(apply_medical_glossary(normalized))
         if not self.uses_llm:
-            return normalized if normalized != raw or True else normalized
+            return normalized
         ctx = (context or "")[-LLM_MAX_CONTEXT:]
         try:
             t0 = time.time()
@@ -216,6 +301,7 @@ class TextCorrector:
                                          _chat_messages(normalized, ctx),
                                          LLM_TIMEOUT_S)
             out = local_normalize(out.strip())
+            out = spoken_to_digits(apply_medical_glossary(out))
             # Guard: LLM must not balloon or empty the text.
             if not out or len(out) > max(2000, len(normalized) * 3):
                 log.warning("LLM correction rejected (len %d -> %d)", len(normalized), len(out))

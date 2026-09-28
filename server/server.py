@@ -68,6 +68,10 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "admin123")  # admin panel token (X-Admin
 # forward pass once per block and stay ahead of realtime on weak CPUs.
 DECODE_BLOCK_S = float(os.getenv("DECODE_BLOCK_S", "0.5"))
 DECODE_FLUSH_S = float(os.getenv("DECODE_FLUSH_S", "0.25"))  # max wait before flushing a partial block
+# Kill a session whose socket is alive but no audio arrives (dead mic /
+# suspended phone). Real silence still streams frames, so a long gap means
+# the client is gone; without this the session hangs forever.
+IDLE_TIMEOUT_S = float(os.getenv("IDLE_TIMEOUT_S", "120"))
 # ================================
 
 HERE = Path(__file__).resolve().parent
@@ -114,6 +118,8 @@ class Room:
         self.rec_transcript: list[dict] = []
         self.kick_requested = False
         self.broadcaster_task = None
+        self.last_frame_ts = 0.0  # wall time of last received audio chunk
+        self.last_end = None      # {"code","fed_s","ts"} of last session end
         # perf monitor (updated during a live session, exposed via /health):
         self.lag_s = 0.0      # wall_elapsed - fed_s; >2s means slower than realtime
         self.decode_ms = 0.0  # EMA of one accept+decode+get_result cycle
@@ -133,6 +139,7 @@ class Room:
             "lag_s": round(self.lag_s, 1),
             "decode_ms": round(self.decode_ms, 1),
             "queue_max": self.queue_max,
+            "last_end": self.last_end,
         }
         if with_grants:
             d["grants"] = [
@@ -368,6 +375,7 @@ async def run_session(room: Room, frames: asyncio.Queue, loop: asyncio.AbstractE
     last_decode = wall_start
     room.lag_s = 0.0
     room.queue_max = 0
+    end_reason = "disconnect"
 
     def decode_block():
         """Accept one buffered block, decode once, emit new hypothesis delta."""
@@ -398,6 +406,7 @@ async def run_session(room: Room, frames: asyncio.Queue, loop: asyncio.AbstractE
         # admin kick?
         if room.kick_requested:
             room.kick_requested = False
+            end_reason = "kick"
             break
         if len(buf) // 2 >= block_samples:
             decode_block()
@@ -410,9 +419,16 @@ async def run_session(room: Room, frames: asyncio.Queue, loop: asyncio.AbstractE
             else:
                 maybe_correct()
             room.lag_s = max(0.0, (time.time() - wall_start) - fed / SAMPLE_RATE)
+            if fed > 0 and room.last_frame_ts and \
+                    (time.time() - room.last_frame_ts) > IDLE_TIMEOUT_S:
+                log.warning("[SRV] session idle %.0fs with no audio room=%s — finalizing",
+                            time.time() - room.last_frame_ts, room.id)
+                end_reason = "idle"
+                break
             continue
         if chunk is None:
             break
+        room.last_frame_ts = time.time()
         room.queue_max = max(room.queue_max, frames.qsize())
         if room.rec_wav is not None:
             try:
@@ -441,6 +457,7 @@ async def run_session(room: Room, frames: asyncio.Queue, loop: asyncio.AbstractE
     archive_session(room, fed / SAMPLE_RATE if fed else 0.0)
     room.fed_s = fed / SAMPLE_RATE
     await publish(room, {"type": "done", "ts": time.time()})
+    return end_reason
 
 
 async def broadcaster(room: Room):
@@ -763,30 +780,61 @@ async def ws_lecturer(ws: WebSocket):
     session = asyncio.create_task(run_session(room, room.lecturer_frames, loop))
     await ws.send_json({"type": "ready", "room": rid})
     log.info("[SRV] lecturer live room=%s.", rid)
+    end_code = None
+
+    async def recv_loop():
+        nonlocal end_code
+        try:
+            while True:
+                message = await ws.receive()
+                if message["type"] == "websocket.disconnect":
+                    end_code = message.get("code")  # 1000=user stop, 1001=page gone, 1006=timeout/drop
+                    return
+                data = message.get("bytes")
+                if data:
+                    if len(data) % 2 == 1:
+                        data = data[:-1]
+                    await room.lecturer_frames.put(bytes(data))
+        finally:
+            try:
+                await room.lecturer_frames.put(None)  # end session if still running
+            except Exception:
+                pass
+
+    recv_task = asyncio.create_task(recv_loop())
     try:
-        while True:
-            message = await ws.receive()
-            if message["type"] == "websocket.disconnect":
-                break
-            data = message.get("bytes")
-            if data:
-                if len(data) % 2 == 1:
-                    data = data[:-1]
-                await room.lecturer_frames.put(bytes(data))
-    finally:
-        try:
-            await room.lecturer_frames.put(None)
-        except Exception:
-            pass
-        try:
-            await session
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log.warning("[SRV] session task failed room=%s: %s", rid, e)
-        room.lecturer_connected = False
-        room.lag_s = 0.0
-        log.info("[SRV] lecturer disconnected room=%s.", rid)
+        done, _ = await asyncio.wait({session, recv_task},
+                                     return_when=asyncio.FIRST_COMPLETED)
+    except asyncio.CancelledError:
+        session.cancel()
+        recv_task.cancel()
+        raise
+    reason = "error"
+    try:
+        if session in done:
+            reason = session.result()
+            if not recv_task.done():
+                # Session ended first (idle timeout / kick): the socket is
+                # useless now — close it so the phone reconnects immediately.
+                recv_task.cancel()
+                try:
+                    await ws.send_json({"type": "idle",
+                                        "text": "session ended — reconnect to start a new one"})
+                    await ws.close(code=4000)
+                except Exception:
+                    pass
+        else:
+            reason = await session  # disconnect path: None queued above ends it
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.warning("[SRV] session task failed room=%s: %s", rid, e)
+    room.lecturer_connected = False
+    room.lag_s = 0.0
+    room.last_end = {"code": end_code, "reason": reason,
+                     "fed_s": round(room.fed_s, 1), "ts": time.time()}
+    log.info("[SRV] lecturer disconnected room=%s code=%s reason=%s fed=%.0fs.",
+             rid, end_code, reason, room.fed_s)
 
 
 if __name__ == "__main__":
