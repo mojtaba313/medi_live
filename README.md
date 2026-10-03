@@ -12,13 +12,62 @@ transcript live. Two-stage text: **raw** ASR output instantly, then a
 
 ## Quickstart
 
-### Server
+### Docker (recommended — one command on any machine)
+
+Prerequisite: **Docker** only (Docker Desktop, or Docker Engine + the Compose
+plugin). No Python, Node, pnpm or SSL setup required.
+
+```bash
+git clone --recurse-submodules <your-repo-url> medi-live
+cd medi-live
+# The ASR weights are a git submodule with LFS (~438MB) and must be present
+# before the build:
+git submodule update --init server/model && git lfs pull
+
+cp .env.docker.example .env
+# Edit .env: set ADMIN_TOKEN and TLS_SAN (this machine's LAN IP).
+# Find your IP with:  ip -4 -o addr show scope global
+#   (on macOS: ifconfig | grep "inet ")
+
+docker compose up -d --build     # first build ~5-10 min
+docker compose logs -f            # watch it start
+```
+
+Open **`https://<this-machine-ip>:8443`** on the phone and accept the
+certificate warning once per device (required before the browser will grant
+microphone access).
+
+`TLS_SAN` matters: the container generates its own certificate on first boot,
+listing `localhost` plus whatever you put in `TLS_SAN`. Without your machine's
+LAN IP in that list, the phone shows a name-mismatch error on every page and
+**the microphone will not work**.
+
+| Command | Purpose |
+|---|---|
+| `docker compose up -d --build` | build (if needed) and start |
+| `docker compose logs -f` | follow logs |
+| `docker compose restart` | restart without rebuilding |
+| `docker compose down` | stop and remove the container (**your data survives**) |
+
+**Where your data lives** — everything the app writes is bind-mounted out of the
+container, so rebuilding or removing it never loses a lecture:
+
+```
+server/data/rooms.json   rooms + recording-permission grants
+server/data/app.db       per-class vocabularies (SQLite)
+server/data/archive/     recorded WAVs + transcripts
+certs/                   generated TLS certificate (reused across restarts)
+```
+
+Back up = copy those two folders. On Linux you can set
+`network_mode: host` in `docker-compose.yml` to skip `TLS_SAN` entirely.
+
+### Server (manual development)
 
 ```bash
 git clone --recurse-submodules <your-repo-url> medi-live
 cd medi-live/server
 python -m venv ../.venv && ../.venv/bin/pip install -r requirements.txt
-cp .env.example .env.local  # optional: set ADMIN_TOKEN etc.
 ../.venv/bin/python server.py   # serves on :8000
 ```
 
@@ -39,16 +88,36 @@ The dev server proxies `/api`, `/ws`, `/archive` to the backend, so no
 mixed-content issues on HTTPS pages. Optional overrides in `client/.env`:
 `VITE_API_BASE`, `VITE_WS_BASE`, `BACKEND_URL`.
 
+Note: in Docker you do **not** run this — the image builds the client itself
+and `server.py` serves `client/dist` alongside the API on the same port.
+
+## Per-class vocabularies
+
+Each room has its own term list (eye anatomy for one lecture, cardiology for
+the next) stored in SQLite and edited from **Admin → 📚 واژگان**. Terms are
+applied when correcting that room's transcript, on top of the shared
+`server/medical_glossary.json`. Paste a whole term list at once (one term per
+line) from the lecture slides; changes apply immediately without a restart.
+
 ## Key env vars (server)
+
+Read from the process environment. In Docker these live in `.env` (Compose
+loads it automatically); running `server.py` directly, export them in your shell
+(note: `.env.local` is *not* read by the app).
 
 | var | default | purpose |
 |---|---|---|
+| `PORT` | `8000` (`8443` in Docker) | listen port |
 | `ADMIN_TOKEN` | `admin123` | admin panel login (`X-Admin-Token`) |
+| `DATA_DIR` | `server/` (`/data`) | where `rooms.json`, `app.db`, `archive/` live |
+| `APP_DB` | `<DATA_DIR>/app.db` | per-class glossary SQLite file |
+| `CLIENT_DIST` | `../dist` (`/app/dist`) | built web client to serve |
 | `CORRECTOR_BACKEND` | `auto` | `auto\|local\|openai\|ollama\|off` |
 | `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` | — | optional LLM correction |
 | `OLLAMA_URL` / `OLLAMA_MODEL` | `localhost:11434 / qwen2.5:1.5b` | optional local LLM |
 | `DECODE_BLOCK_S` / `DECODE_FLUSH_S` | `0.5 / 0.25` | decode batching (latency) |
 | `CORRECT_MIN_CHARS` / `CORRECT_MAX_CHARS` / `CORRECT_TIMEOUT_S` | `50 / 400 / 5.0` | correction chunking |
+| `TLS_SAN` | — (Docker) | extra certificate SANs; set to this machine's LAN IP |
 
 Demo audio (`server/class.mp3`) is intentionally not shipped — drop any
 lecture mp3 there for the offline `recorded.py` transcription script.
@@ -57,5 +126,8 @@ lecture mp3 there for the offline `recorded.py` transcription script.
 
 ```
 client/src/{App,main,styles.css,components/Layout,pages/{Home,Live,Record,Admin},lib/api}
-server/{server.py,corrector.py,recorded.py,main.py,model/,archive/}
+server/{server.py,corrector.py,db.py,recorded.py,main.py,model/,archive/}
+docker/entrypoint.sh        # first-boot TLS cert + uvicorn
+Dockerfile                  # client build stage + python runtime stage
+docker-compose.yml          # one service, https on :8443, data volumes
 ```

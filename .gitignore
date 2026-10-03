@@ -17,12 +17,21 @@ archive/
 # local secrets & dev TLS certs (never commit)
 *.pem
 .env.local
+.env
+
+# docker: runtime state volume + generated TLS certs
+server/data/
+certs/
 
 # server runtime state (recreated automatically)
 rooms.json
 server/rooms.json
 server/archive/*
 !server/archive/.gitkeep
+# per-class glossary SQLite db (dev runs; docker keeps it in server/data/)
+server/app.db
+server/app.db-shm
+server/app.db-wal
 
 # large local audio (demo data + generated cache, not shipped)
 server/class.mp3

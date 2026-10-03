@@ -67,7 +67,7 @@ export default function Admin() {
         <>
           <div className="row">
             <div className="tabs" style={{ margin: 0 }}>
-              {[["rooms", "🏠 اتاق‌ها"], ["perms", "🔑 مجوز ضبط"], ["archive", "🗄️ آرشیو"], ["live", "🎛️ کنترل زنده"]].map(([k, label]) => (
+              {[["rooms", "🏠 اتاق‌ها"], ["perms", "🔑 مجوز ضبط"], ["glossary", "📚 واژگان"], ["archive", "🗄️ آرشیو"], ["live", "🎛️ کنترل زنده"]].map(([k, label]) => (
                 <button key={k} className={tab === k ? "on" : ""} onClick={() => setParams({ tab: k })}>
                   {label}
                 </button>
@@ -78,6 +78,7 @@ export default function Admin() {
           </div>
           {tab === "rooms" && <RoomsTab />}
           {tab === "perms" && <PermsTab />}
+          {tab === "glossary" && <GlossaryTab />}
           {tab === "archive" && <ArchiveTab />}
           {tab === "live" && <LiveTab corrector={corrector} />}
         </>
@@ -272,6 +273,108 @@ function PermsTab() {
         ))}
       </div>
       {grants.length === 0 && <div className="empty mt">هنوز کدی برای این اتاق ساخته نشده — یکی بسازید تا ضبط گیت شود.</div>}
+    </>
+  );
+}
+
+/* ---------------- per-class glossary ---------------- */
+function GlossaryTab() {
+  const [rooms, setRooms] = useState([]);
+  const [room, setRoom] = useState("live");
+  const [terms, setTerms] = useState([]);
+  const [one, setOne] = useState("");
+  const [bulk, setBulk] = useState("");
+  const [msg, setMsg] = useState("");
+  const [q, setQ] = useState("");
+
+  async function refreshRooms() {
+    const r = await api.listRooms();
+    setRooms(r.rooms || []);
+    if (!(r.rooms || []).some((x) => x.id === room) && (r.rooms || []).length) setRoom(r.rooms[0].id);
+  }
+  async function refreshTerms(rid = room) {
+    try {
+      const g = await api.getGlossary(rid);
+      setTerms(g.terms || []);
+    } catch (e) { setMsg("⚠️ " + e.message); }
+  }
+  useEffect(() => { refreshRooms().then(() => refreshTerms()); /* eslint-disable-next-line */ }, []);
+  useEffect(() => { refreshTerms(); setBulk(""); setQ(""); /* eslint-disable-next-line */ }, [room]);
+
+  async function addOne(e) {
+    e?.preventDefault();
+    if (!one.trim()) return;
+    const r = await api.addGlossary(room, one.trim());
+    setOne("");
+    setMsg(r.added ? "✅ اضافه شد." : "ℹ️ تکراری بود.");
+    refreshTerms();
+  }
+  async function remove(t) {
+    await api.deleteGlossaryTerm(room, t);
+    refreshTerms();
+  }
+  async function replaceAll() {
+    const list = bulk.split("\n").map((s) => s.trim()).filter(Boolean);
+    if (!list.length) { setMsg("⚠️ لیست خالی است."); return; }
+    if (!confirm(`کل واژگان اتاق ${room} با ${list.length} اصطلاح جایگزین شود؟`)) return;
+    const r = await api.replaceGlossary(room, list);
+    setBulk("");
+    setMsg(`✅ ${r.terms_n} اصطلاح ثبت شد و از همین حالا اعمال می‌شود.`);
+    refreshTerms(); refreshRooms();
+  }
+
+  const visible = terms.filter((t) => !q.trim() || t.includes(q.trim()));
+  const roomInfo = rooms.find((r) => r.id === room);
+
+  return (
+    <>
+      <div className="card mt">
+        <h3>📚 واژگان هر کلاس</h3>
+        <p className="desc">
+          هر اتاق (کلاس) مجموعه اصطلاحات خودش را دارد — مثلاً چشم/گوش برای یک کلاس، قلب برای
+          کلاس دیگر. این اصطلاحات موقع اصلاح متن همان اتاق اعمال می‌شوند (نیازی به ری‌استارت
+          سرور نیست). واژگان فایل سراسری سرور هم برای همه اتاق‌ها اعمال می‌شود.
+        </p>
+        <div className="row">
+          <select className="select" style={{ maxWidth: 280 }} value={room} onChange={(e) => setRoom(e.target.value)}>
+            {rooms.map((r) => <option key={r.id} value={r.id}>{r.name} ({r.id})</option>)}
+          </select>
+          {roomInfo && <span className="pill">📚 {roomInfo.glossary_n ?? terms.length} اصطلاح</span>}
+        </div>
+        <form onSubmit={addOne} className="row mt">
+          <input className="input" style={{ maxWidth: 320 }} value={one} onChange={(e) => setOne(e.target.value)} placeholder="تک‌اصطلاح… مثلاً شبکیه یا Retina" />
+          <button className="btn primary" type="submit">＋ افزودن</button>
+        </form>
+        {msg && <p className="small">{msg}</p>}
+      </div>
+
+      <div className="grid cols-2 mt">
+        <div className="card">
+          <h3>📝 جایگزینی گروهی (از جزوه کلاس)</h3>
+          <p className="desc">هر سطر یک اصطلاح. با ثبت، کل مجموعه این اتاق جایگزین می‌شود.</p>
+          <textarea className="input" rows={10} dir="auto" value={bulk} onChange={(e) => setBulk(e.target.value)} placeholder={"شبکیه\nقرنیه\nRetina\nOptic"} />
+          <div className="row mt">
+            <button className="btn primary" onClick={replaceAll}>ثبت گروهی</button>
+          </div>
+        </div>
+        <div className="card">
+          <div className="row">
+            <h3 style={{ margin: 0 }}>اصطلاحات این اتاق ({terms.length})</h3>
+            <span className="spacer" />
+            <input className="input" style={{ maxWidth: 160 }} value={q} onChange={(e) => setQ(e.target.value)} placeholder="🔍 جست‌وجو…" />
+          </div>
+          <div style={{ maxHeight: 320, overflowY: "auto", marginTop: 8 }}>
+            {visible.map((t) => (
+              <div className="row" key={t} style={{ padding: "4px 0", borderBottom: "1px solid rgba(255,255,255,.06)" }}>
+                <span>{t}</span>
+                <span className="spacer" />
+                <button className="btn danger" onClick={() => remove(t)}>حذف</button>
+              </div>
+            ))}
+            {visible.length === 0 && <div className="empty">اصطلاحی نیست — از کادر بالا اضافه کنید.</div>}
+          </div>
+        </div>
+      </div>
     </>
   );
 }

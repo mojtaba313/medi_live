@@ -1,0 +1,68 @@
+# Medi Live — single-container deployment.
+#
+#   cp .env.docker.example .env    # then edit ADMIN_TOKEN + TLS_SAN
+#   docker compose up -d --build
+#   open https://<this-machine-ip>:8443
+#
+# Everything the app writes lives in ./server/data (rooms, per-class glossaries
+# db, recordings) and ./certs, both bind-mounted — so `docker compose down` or
+# a container rebuild never loses a lecture.
+
+services:
+  medi-live:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: medi-live:latest
+    container_name: medi-live
+    restart: unless-stopped
+    # Run uvicorn as PID 1's init so zombies/SIGTERM are handled correctly.
+    init: true
+
+    ports:
+      # 8443:8443 — single HTTPS port serving the web app, the REST API, the
+      # websocket and the audio archive (same origin, so no CORS/mixed-content).
+      - "${PORT:-8443}:${PORT:-8443}"
+
+    environment:
+      # --- required ---
+      # Admin panel login token (sent as X-Admin-Token). CHANGE THIS.
+      ADMIN_TOKEN: "${ADMIN_TOKEN:-admin123}"
+      # --- TLS ---
+      # Comma-separated extra names/IPs to embed in the certificate.
+      # Set this to this machine's LAN IP (see `hostname -I`) or phones will see
+      # a name-mismatch warning on every page load.
+      TLS_SAN: "${TLS_SAN:-}"
+      # Optional: bring your own certificate instead of the generated one
+      # (paths must be mounted into the container).
+      # TLS_CERT_FILE: /certs/custom-cert.pem
+      # TLS_KEY_FILE: /certs/custom-key.pem
+      # --- text correction (stage 2) ---
+      # auto | local | openai | ollama | off
+      CORRECTOR_BACKEND: "${CORRECTOR_BACKEND:-local}"
+      # OLLAMA_URL: "${OLLAMA_URL:-http://host.docker.internal:11434}"
+      # OLLAMA_MODEL: "${OLLAMA_MODEL:-qwen2.5:1.5b}"
+      # --- decode batching (latency vs. CPU) ---
+      DECODE_BLOCK_S: "${DECODE_BLOCK_S:-0.5}"
+      DECODE_FLUSH_S: "${DECODE_FLUSH_S:-0.25}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+
+    volumes:
+      # All runtime state: rooms.json, app.db (per-class glossaries), archive/
+      - ./server/data:/data
+      # TLS certificate, so the browser trust prompt appears once per device
+      # and not once per restart.
+      - ./certs:/certs
+
+    healthcheck:
+      # --insecure: the certificate is self-signed by design.
+      test: ["CMD-SHELL", "curl -fsk https://localhost:${PORT:-8443}/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Model load + recognizer init takes a while on first boot.
+      start_period: 90s
+
+    # ASR decoding is CPU-bound; on a small box leave this unset so the
+    # container can use every core, or pin it explicitly (e.g. "4").
+    # cpus: 4

@@ -1,0 +1,50 @@
+# Build context exclusions. Everything here is either rebuildable or local-only
+# state; note what is deliberately KEPT:
+#   server/model/  — the 438MB ASR weights (git submodule + LFS). Baked into
+#                    the image on purpose so a new machine needs only Docker.
+
+# --- rebuildable / huge ---
+.venv
+venv
+node_modules
+client/node_modules
+client/dist
+dist
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.git
+**/.gitignore
+.git
+.gitattributes
+.gitmodules
+
+# --- local runtime state (belongs in the /data volume, not the image) ---
+server/archive
+server/data
+server/rooms.json
+server/app.db
+server/app.db-shm
+server/app.db-wal
+server/transcripts.log
+server/class_16k.wav
+
+# --- local-only config & secrets ---
+*.pem
+*.key
+*.crt
+.env
+.env.local
+.env.*
+!.env.example
+!.env.docker.example
+certs
+
+# --- misc ---
+*.log
+*.mp3
+*.wav
+**/.DS_Store
+**/.pytest_cache
+**/.mypy_cache
+docs

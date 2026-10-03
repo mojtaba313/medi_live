@@ -43,8 +43,10 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPExcept
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 import uvicorn
+from fastapi.staticfiles import StaticFiles
 
 from recorded import init_recognizer, fmt_ts, SAMPLE_RATE
+from db import GlossaryStore
 from corrector import (
     load_corrector_from_env,
     looks_sentence_complete,
@@ -58,7 +60,7 @@ log = logging.getLogger("server")
 
 # ============ CONFIG ============
 HOST = "0.0.0.0"
-PORT = 8000
+PORT = int(os.getenv("PORT", "8000"))  # 8000 dev (plain) / 8443 docker (TLS)
 HISTORY_N = 200  # lines replayed to late-joining viewers
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "admin123")  # admin panel token (X-Admin-Token)
 # Decode granularity: accumulate mic audio into blocks before each
@@ -75,13 +77,21 @@ IDLE_TIMEOUT_S = float(os.getenv("IDLE_TIMEOUT_S", "120"))
 # ================================
 
 HERE = Path(__file__).resolve().parent
-ROOMS_FILE = HERE / "rooms.json"
-ARCHIVE_DIR = HERE / "archive"
+# Runtime state (rooms, glossaries db, recordings) lives in DATA_DIR so a Docker
+# deployment can keep it in one mounted volume outside the container.
+#   dev  : DATA_DIR unset -> server/ next to this file (original behavior)
+#   docker: DATA_DIR=/data -> single volume, survives `docker rm`
+DATA_DIR = Path(os.getenv("DATA_DIR", str(HERE)))
+ROOMS_FILE = Path(os.getenv("ROOMS_FILE", str(DATA_DIR / "rooms.json")))
+ARCHIVE_DIR = Path(os.getenv("ARCHIVE_DIR", str(DATA_DIR / "archive")))
 ARCHIVE_META = ARCHIVE_DIR / "archive.json"
-ARCHIVE_DIR.mkdir(exist_ok=True)
+ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+# Built web client (client/dist), mounted into the image by the Dockerfile.
+CLIENT_DIST = Path(os.getenv("CLIENT_DIST", str(HERE.parent / "dist")))
 
 recognizer = None
 corrector = None
+glossary_store = None
 seg_counter = [0]
 stop_event = threading.Event()
 
@@ -141,6 +151,11 @@ class Room:
             "queue_max": self.queue_max,
             "last_end": self.last_end,
         }
+        try:
+            if glossary_store is not None:
+                d["glossary_n"] = len(glossary_store.get_terms(self.id))
+        except Exception:
+            pass
         if with_grants:
             d["grants"] = [
                 {"code": c, **g} for c, g in self.grants.items()
@@ -305,7 +320,8 @@ async def run_session(room: Room, frames: asyncio.Queue, loop: asyncio.AbstractE
         if corrector is None or not corrector.enabled or not raw_joined.strip():
             return
         try:
-            fixed = await corrector.correct(raw_joined, context=room.corrected_tail)
+            fixed = await corrector.correct(raw_joined, context=room.corrected_tail,
+                                            room_id=room.id)
         except Exception as e:
             log.warning("correction failed: %s", e)
             return
@@ -492,11 +508,19 @@ async def heartbeat():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global recognizer, corrector
+    global recognizer, corrector, glossary_store
     load_rooms()
     recognizer = init_recognizer()
     corrector = load_corrector_from_env()
     log.info("corrector: %s", corrector.describe())
+    # Per-class glossaries: SQLite store, warmed into the corrector cache.
+    glossary_store = GlossaryStore()
+    try:
+        for rid, terms in glossary_store.get_all().items():
+            corrector.set_room_terms(rid, terms)
+        log.info("glossaries loaded for %d rooms", len(corrector._room_terms))
+    except Exception as e:
+        log.warning("glossary warm-up failed: %s", e)
     log.info("admin token: %s", "***" if ADMIN_TOKEN else "(none — open admin!)")
     stop_event.clear()
     for room in ROOMS.values():
@@ -517,6 +541,13 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
+# Built web client: hashed assets get a real static mount (fast, cacheable).
+# The SPA catch-all route is registered at the very END of this file so that
+# /api, /ws and /archive always win over it.
+if (CLIENT_DIST / "assets").is_dir():
+    app.mount("/assets", StaticFiles(directory=str(CLIENT_DIST / "assets")),
+              name="assets")
+
 
 @app.get("/health")
 def health():
@@ -533,11 +564,19 @@ def health():
 
 @app.get("/", response_class=HTMLResponse)
 def index():
+    # When the built client is present (Docker image / after `pnpm build`),
+    # hand the SPA over so react-router owns the root path. Otherwise fall back
+    # to the standalone-server help text.
+    built_index = CLIENT_DIST / "index.html"
+    if built_index.is_file():
+        return FileResponse(str(built_index))
     return ("<h3>Medi Live server</h3>"
             "<p>Lecturer: <code>/record</code> route of the React app. "
             "Viewers: <code>/</code> route. Admin: <code>/admin</code>.</p>"
             "<p>Two-stage text: <code>transcript(stage=raw)</code> instantly, "
-            "<code>correction(stage=corrected)</code> replaces it. See <code>/health</code>.</p>")
+            "<code>correction(stage=corrected)</code> replaces it. See <code>/health</code>.</p>"
+            "<p>Client not built — run <code>pnpm build</code> in <code>client/</code>, "
+            "or use <code>pnpm dev</code>.</p>")
 
 
 # ---------------------------------------------------------------- admin REST
@@ -594,6 +633,13 @@ def api_delete_room(rid: str, req: Request):
         room.broadcaster_task.cancel()
     del ROOMS[rid]
     save_rooms()
+    try:
+        if glossary_store is not None:
+            glossary_store.delete_room(rid)
+        if corrector is not None:
+            corrector.set_room_terms(rid, [])
+    except Exception as e:
+        log.warning("room glossary cleanup failed %s: %s", rid, e)
     return {"ok": True}
 
 
@@ -630,6 +676,67 @@ def api_revoke_grant(rid: str, code: str, req: Request):
     room.grants.pop(code, None)
     save_rooms()
     return {"ok": True}
+
+
+# ---------------------------------------------------------------- per-class glossaries
+
+def _refresh_room_glossary(rid: str):
+    """Push the room's current DB terms into the corrector cache."""
+    try:
+        if glossary_store is not None and corrector is not None:
+            corrector.set_room_terms(rid, glossary_store.get_terms(rid))
+    except Exception as e:
+        log.warning("glossary cache refresh failed room=%s: %s", rid, e)
+
+
+@app.get("/api/rooms/{rid}/glossary")
+def api_get_glossary(rid: str, req: Request):
+    """Room's own terms + counts (global terms apply to every room)."""
+    check_admin(req)
+    get_room(rid)
+    return {"room": rid,
+            "terms": glossary_store.get_terms(rid),
+            "room_n": len(glossary_store.get_terms(rid))}
+
+
+@app.post("/api/rooms/{rid}/glossary")
+async def api_add_glossary(rid: str, req: Request):
+    """Add one term {term} or many {terms:[...]} to the room's set."""
+    check_admin(req)
+    get_room(rid)
+    body = await req.json()
+    if isinstance(body.get("terms"), list):
+        added = glossary_store.add_many(rid, body["terms"])
+    else:
+        term = (body.get("term") or "").strip()
+        if not term:
+            raise HTTPException(400, "provide 'term' or 'terms'")
+        added = 1 if glossary_store.add_term(rid, term) else 0
+    _refresh_room_glossary(rid)
+    return {"ok": True, "added": added, "room": rid}
+
+
+@app.put("/api/rooms/{rid}/glossary")
+async def api_replace_glossary(rid: str, req: Request):
+    """Replace the room's whole set — paste the class's term list at once."""
+    check_admin(req)
+    get_room(rid)
+    body = await req.json()
+    terms = body.get("terms")
+    if not isinstance(terms, list):
+        raise HTTPException(400, "'terms' must be a list of strings")
+    n = glossary_store.replace_terms(rid, terms)
+    _refresh_room_glossary(rid)
+    return {"ok": True, "room": rid, "terms_n": n}
+
+
+@app.delete("/api/rooms/{rid}/glossary/{term}")
+def api_delete_glossary_term(rid: str, term: str, req: Request):
+    check_admin(req)
+    get_room(rid)
+    ok = glossary_store.delete_term(rid, term)
+    _refresh_room_glossary(rid)
+    return {"ok": ok}
 
 
 @app.post("/api/rooms/{rid}/clear")
@@ -835,6 +942,27 @@ async def ws_lecturer(ws: WebSocket):
                      "fed_s": round(room.fed_s, 1), "ts": time.time()}
     log.info("[SRV] lecturer disconnected room=%s code=%s reason=%s fed=%.0fs.",
              rid, end_code, reason, room.fed_s)
+
+
+# --------------------------------------------------------- built web client
+# Registered LAST on purpose: FastAPI matches routes in declaration order, so
+# every /api, /ws and /archive route above takes precedence. Only unmatched
+# paths fall through here, which is what a client-side-routed SPA (react-router
+# paths like /record, /admin) needs. Without this, a browser refresh on /admin
+# would 404.
+if (CLIENT_DIST / "index.html").is_file():
+    _SPA_INDEX = CLIENT_DIST / "index.html"
+
+    @app.get("/{spa_path:path}", include_in_schema=False)
+    def spa(spa_path: str = ""):
+        if spa_path.startswith(("api/", "archive/", "ws", "health")):
+            raise HTTPException(404, "not found")
+        # Serve a real file if the build emitted one (favicon, manifest, ...).
+        candidate = (CLIENT_DIST / spa_path).resolve() if spa_path else None
+        if candidate and candidate.is_file() and str(candidate).startswith(
+                str(CLIENT_DIST.resolve())):
+            return FileResponse(str(candidate))
+        return FileResponse(str(_SPA_INDEX))
 
 
 if __name__ == "__main__":

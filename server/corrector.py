@@ -98,8 +98,10 @@ def looks_sentence_complete(text: str) -> bool:
 _HERE = Path(__file__).resolve().parent
 _GLOSSARY_PATH = Path(os.getenv("MEDICAL_GLOSSARY", str(_HERE / "medical_glossary.json")))
 
-# Canonical medical/anatomy terms (Persian). Loaded from medical_glossary.json
-# next to this file; missing file -> empty list (normalizer still works).
+# Canonical medical/anatomy terms shared by ALL rooms. Loaded from
+# medical_glossary.json next to this file; missing file -> empty list
+# (normalizer still works). Per-class terms live in SQLite (db.py) and are
+# layered on top via TextCorrector.set_room_terms().
 GLOSSARY_TERMS: list[str] = []
 try:
     if _GLOSSARY_PATH.exists():
@@ -128,12 +130,19 @@ _SPOKEN_DIGITS = {
 _STRIP_PUNCT = "،؛؟!.:?!,…«»\"'\"()[]{}<>-–—/\\"
 
 
-def apply_medical_glossary(text: str) -> str:
+def apply_medical_glossary(text: str, terms: list[str] | None = None) -> str:
     """Snap near-miss words to glossary terms (fixes CTC mishearing of
-    anatomical/Latin terms). Conservative: only words >= 6 chars, similarity
-    >= 0.86, never touches words already correct."""
-    if not text or not GLOSSARY_TERMS:
+    anatomical/Latin terms). Conservative: length-gated words, similarity
+    cutoff scaled by length, never touches words already correct.
+
+    `terms`: combined global + per-room list. None -> global list only
+    (backward compatible).
+    """
+    terms = GLOSSARY_TERMS if terms is None else terms
+    if not text or not terms:
         return text
+    term_set = set(terms)
+    lower = {t.lower(): t for t in terms if t.isascii()}
     out = []
     for w in text.split():
         core = w
@@ -148,17 +157,17 @@ def apply_medical_glossary(text: str) -> str:
         # Latin-script words can be short ("Lens", "RPE") — script mismatch
         # with Persian text makes short matches safe; Persian words need >= 6.
         min_len = 4 if core.isascii() and core.isalpha() else 6
-        if len(core) >= min_len and core not in GLOSSARY_TERMS:
+        if len(core) >= min_len and core not in term_set:
             # Shorter words need a looser cutoff: one substitution in a
             # 6-char word scores ~0.83, so 0.86 would never fire there.
             cutoff = 0.8 if len(core) < 8 else 0.86
             if core.isascii():
-                m = get_close_matches(core.lower(), list(_GLOSSARY_LOWER),
+                m = get_close_matches(core.lower(), list(lower),
                                       n=1, cutoff=cutoff)
                 if m:
-                    core = _GLOSSARY_LOWER[m[0]]
+                    core = lower[m[0]]
             else:
-                m = get_close_matches(core, GLOSSARY_TERMS, n=1, cutoff=cutoff)
+                m = get_close_matches(core, terms, n=1, cutoff=cutoff)
                 if m:
                     core = m[0]
         out.append(lead + core + trail)
@@ -258,7 +267,26 @@ class TextCorrector:
             self.backend = "openai" if self.openai_key else "local"
 
         log.info("corrector backend: requested=%s effective=%s", self.requested, self.backend)
-        log.info("medical glossary: %d terms from %s", len(GLOSSARY_TERMS), _GLOSSARY_PATH.name)
+        log.info("medical glossary: %d global terms from %s", len(GLOSSARY_TERMS), _GLOSSARY_PATH.name)
+        # Per-room (per-class) term sets, filled from SQLite at startup and
+        # refreshed on every admin glossary edit. room_id -> list of terms.
+        self._room_terms: dict[str, list[str]] = {}
+
+    def set_room_terms(self, room_id: str, terms: list[str]) -> None:
+        """Replace the cached per-room set (called at startup + on admin edits)."""
+        cleaned = [str(t).strip() for t in (terms or []) if str(t).strip()]
+        if cleaned:
+            self._room_terms[room_id] = cleaned
+        else:
+            self._room_terms.pop(room_id, None)
+
+    def terms_for(self, room_id: str | None) -> list[str]:
+        """Global terms + this room's terms, deduplicated (global first)."""
+        if not room_id or room_id not in self._room_terms:
+            return GLOSSARY_TERMS
+        seen = set(GLOSSARY_TERMS)
+        extra = [t for t in self._room_terms[room_id] if t not in seen]
+        return GLOSSARY_TERMS + extra
 
     @property
     def enabled(self) -> bool:
@@ -277,15 +305,17 @@ class TextCorrector:
         return {"backend": self.backend, "model": model,
                 "min_chars": CORRECT_MIN_CHARS, "max_chars": CORRECT_MAX_CHARS,
                 "timeout_s": CORRECT_TIMEOUT_S,
-                "glossary_n": len(GLOSSARY_TERMS)}
+                "glossary_global_n": len(GLOSSARY_TERMS),
+                "glossary_rooms": {rid: len(t) for rid, t in self._room_terms.items()}}
 
-    async def correct(self, raw: str, context: str = "") -> str | None:
+    async def correct(self, raw: str, context: str = "", room_id: str | None = None) -> str | None:
         """Return corrected text, or None if disabled/empty/unusable."""
         raw = (raw or "").strip()
         if not raw or not self.enabled:
             return None
+        terms = self.terms_for(room_id)
         normalized = local_normalize(raw)
-        normalized = spoken_to_digits(apply_medical_glossary(normalized))
+        normalized = spoken_to_digits(apply_medical_glossary(normalized, terms))
         if not self.uses_llm:
             return normalized
         ctx = (context or "")[-LLM_MAX_CONTEXT:]
@@ -301,7 +331,7 @@ class TextCorrector:
                                          _chat_messages(normalized, ctx),
                                          LLM_TIMEOUT_S)
             out = local_normalize(out.strip())
-            out = spoken_to_digits(apply_medical_glossary(out))
+            out = spoken_to_digits(apply_medical_glossary(out, terms))
             # Guard: LLM must not balloon or empty the text.
             if not out or len(out) > max(2000, len(normalized) * 3):
                 log.warning("LLM correction rejected (len %d -> %d)", len(normalized), len(out))

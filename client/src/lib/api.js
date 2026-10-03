@@ -83,6 +83,16 @@ export const api = {
   createGrant: (id, label) =>
     req(`/api/rooms/${id}/grants`, { method: "POST", body: JSON.stringify({ label }) }),
   revokeGrant: (room, code) => req(`/api/rooms/${room}/grants/${code}`, { method: "DELETE" }),
+  getGlossary: (id) => req(`/api/rooms/${id}/glossary`),
+  addGlossary: (id, terms) =>
+    req(`/api/rooms/${id}/glossary`, {
+      method: "POST",
+      body: JSON.stringify(Array.isArray(terms) ? { terms } : { term: terms }),
+    }),
+  replaceGlossary: (id, terms) =>
+    req(`/api/rooms/${id}/glossary`, { method: "PUT", body: JSON.stringify({ terms }) }),
+  deleteGlossaryTerm: (room, term) =>
+    req(`/api/rooms/${room}/glossary/${encodeURIComponent(term)}`, { method: "DELETE" }),
   clearRoom: (id) => req(`/api/rooms/${id}/clear`, { method: "POST" }),
   kickRoom: (id) => req(`/api/rooms/${id}/kick`, { method: "POST" }),
   exportRoom: (id, format = "json") => req(`/api/rooms/${id}/export?format=${format}`),
