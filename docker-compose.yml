@@ -14,24 +14,31 @@ services:
       context: .
       dockerfile: Dockerfile
     image: medi-live:latest
-    container_name: medi-live
+    # Fixed name so `docker logs medi-live` always works. Set CONTAINER_NAME to
+    # something else to run a second instance side by side (e.g. while testing
+    # a new machine) — two containers cannot share the same name.
+    container_name: "${CONTAINER_NAME:-medi-live}"
     restart: unless-stopped
     # Run uvicorn as PID 1's init so zombies/SIGTERM are handled correctly.
     init: true
 
     ports:
-      # 8443:8443 — single HTTPS port serving the web app, the REST API, the
-      # websocket and the audio archive (same origin, so no CORS/mixed-content).
+      # Single HTTPS port serving the web app, the REST API, the websocket and
+      # the audio archive (same origin, so no CORS and no mixed content).
+      # PORT must be passed into the container too (see below), otherwise the
+      # container keeps listening on 8443 while the host forwards to PORT.
       - "${PORT:-8443}:${PORT:-8443}"
 
     environment:
       # --- required ---
       # Admin panel login token (sent as X-Admin-Token). CHANGE THIS.
       ADMIN_TOKEN: "${ADMIN_TOKEN:-admin123}"
+      # Container listen port. Kept in sync with the published port above.
+      PORT: "${PORT:-8443}"
       # --- TLS ---
       # Comma-separated extra names/IPs to embed in the certificate.
-      # Set this to this machine's LAN IP (see `hostname -I`) or phones will see
-      # a name-mismatch warning on every page load.
+      # Set this to this machine's LAN IP (see `ip -4 -o addr show scope
+      # global`) or phones will see a name-mismatch warning on every page.
       TLS_SAN: "${TLS_SAN:-}"
       # Optional: bring your own certificate instead of the generated one
       # (paths must be mounted into the container).
