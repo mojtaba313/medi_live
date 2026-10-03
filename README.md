@@ -62,6 +62,38 @@ certs/                   generated TLS certificate (reused across restarts)
 Back up = copy those two folders. On Linux you can set
 `network_mode: host` in `docker-compose.yml` to skip `TLS_SAN` entirely.
 
+### Offline / USB deployment (no build on the target machine)
+
+To hand the app to a lecture PC that should not clone, build, or need internet,
+package the finished image once and carry it across:
+
+```bash
+./docker/bundle.sh              # -> dist/medi-live-<version>-<date>-<arch>/
+```
+
+The bundle holds the image (`medi-live-image.tar.gz`, ~690MB), a `compose`
+file **without** a `build:` section, a `.env.example`, and `INSTALL.txt` with
+these instructions. Copy the folder to a USB stick. On the target machine:
+
+```bash
+gunzip -c medi-live-image.tar.gz | docker load   # ~40s, writes ~2GB
+cp .env.example .env      # set ADMIN_TOKEN + TLS_SAN (that machine's LAN IP)
+docker compose up -d
+```
+
+Nothing is compiled on the target, and `pull_policy: never` guarantees it never
+reaches for a registry. `certs/` ships **empty** on purpose, so every machine
+generates its own certificate from its own `TLS_SAN`.
+
+| Bundle variable | Effect |
+|---|---|
+| `RAW=1 ./docker/bundle.sh` | uncompressed `.tar` (2GB, fastest to load) |
+| `ZSTD=1 ./docker/bundle.sh` | `.tar.zst` (smallest, needs `zstd`) |
+| `VERSION=... IMAGE=... ./docker/bundle.sh` | override tag/name |
+
+Runtime state (`server/data/`, `certs/`) is **not** in the bundle — copy those
+two folders separately to carry recordings and vocabularies to another machine.
+
 ### Server (manual development)
 
 ```bash
@@ -129,5 +161,7 @@ client/src/{App,main,styles.css,components/Layout,pages/{Home,Live,Record,Admin}
 server/{server.py,corrector.py,db.py,recorded.py,main.py,model/,archive/}
 docker/entrypoint.sh        # first-boot TLS cert + uvicorn
 Dockerfile                  # client build stage + python runtime stage
-docker-compose.yml          # one service, https on :8443, data volumes
+docker-compose.yml          # builds the image; serves https on :8443
+docker-compose.deploy.yml   # same, but prebuilt image only (offline/USB)
+docker/bundle.sh            # package image + config for offline deployment
 ```

@@ -22,6 +22,7 @@ archive/
 # docker: runtime state volume + generated TLS certs
 server/data/
 certs/
+dist/
 
 # server runtime state (recreated automatically)
 rooms.json

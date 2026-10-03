@@ -1,0 +1,81 @@
+# =============================================================================
+# Medi Live — OFFLINE / prebuilt-image deployment.
+#
+# Use this on a machine that will NOT build the image (e.g. loaded from a USB
+# stick on a lecture PC). It is identical to docker-compose.yml except:
+#   - no `build:` section, so `docker compose up` never compiles anything
+#   - `pull_policy: never`, so it never tries to reach a registry
+# It expects the image to already exist locally (`docker load -i <file>`).
+#
+#   docker load -i medi-live-image.tar.gz
+#   cp .env.example .env      # then set ADMIN_TOKEN + TLS_SAN
+#   docker compose up -d
+#
+# To BUILD instead (developer machine), use ./docker-compose.yml.
+# =============================================================================
+
+services:
+  medi-live:
+    image: medi-live:latest
+    # Never contact a registry: this file is for air-gapped/offline use. If the
+    # image is missing, Docker fails immediately with a clear "no such image"
+    # instead of hanging on a network timeout.
+    pull_policy: never
+    # Fixed name so `docker logs medi-live` always works. Set CONTAINER_NAME to
+    # run a second instance side by side.
+    container_name: "${CONTAINER_NAME:-medi-live}"
+    restart: unless-stopped
+    # Run uvicorn under PID 1's init so SIGTERM/zombies are handled correctly.
+    init: true
+
+    ports:
+      # Single HTTPS port serving the web app, REST API, websocket and the audio
+      # archive (same origin, so no CORS and no mixed content). PORT is also
+      # passed into the container below so both sides stay in sync.
+      - "${PORT:-8443}:${PORT:-8443}"
+
+    environment:
+      # --- required ---
+      # Admin panel login token (sent as X-Admin-Token). CHANGE THIS.
+      ADMIN_TOKEN: "${ADMIN_TOKEN:-admin123}"
+      # Container listen port.
+      PORT: "${PORT:-8443}"
+      # --- TLS ---
+      # THIS MACHINE's LAN IP. The bundled certificate only covers the SANs it
+      # was generated with; if your phone connects to an address that is not
+      # listed, the browser shows a name mismatch and the MIC WILL NOT WORK.
+      # Find your IP with:  ip -4 -o addr show scope global
+      TLS_SAN: "${TLS_SAN:-}"
+      # Optional: bring your own certificate instead of the bundled generated
+      # one (paths must be mounted into the container).
+      # TLS_CERT_FILE: /certs/custom-cert.pem
+      # TLS_KEY_FILE: /certs/custom-key.pem
+      # --- text correction (stage 2) ---
+      # local | ollama | openai | auto | off
+      CORRECTOR_BACKEND: "${CORRECTOR_BACKEND:-local}"
+      # OLLAMA_URL: "${OLLAMA_URL:-http://host.docker.internal:11434}"
+      # OLLAMA_MODEL: "${OLLAMA_MODEL:-qwen2.5:1.5b}"
+      # --- decode batching (raw-text latency vs CPU) ---
+      DECODE_BLOCK_S: "${DECODE_BLOCK_S:-0.5}"
+      DECODE_FLUSH_S: "${DECODE_FLUSH_S:-0.25}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+
+    volumes:
+      # All runtime state: rooms.json, app.db (per-class glossaries), archive/
+      - ./server/data:/data
+      # TLS certificate, so the browser trust prompt appears once per device
+      # and not once per restart.
+      - ./certs:/certs
+
+    healthcheck:
+      # --insecure: the bundled certificate is self-signed by design.
+      test: ["CMD-SHELL", "curl -fsk https://localhost:${PORT:-8443}/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Model load + recognizer init takes a while on first boot.
+      start_period: 90s
+
+    # ASR decoding is CPU-bound; leave unset to use every core, or pin it
+    # explicitly (e.g. "4" on a 4-core machine).
+    # cpus: 4
